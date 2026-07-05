@@ -155,6 +155,14 @@ def main() -> None:
     if not PROVIDERS:
         raise SystemExit("Не включено ни одной площадки (проверьте ENABLED_PROVIDERS).")
 
+    # В Python 3.12+/3.14 asyncio больше не создаёт event loop автоматически,
+    # а python-telegram-bot внутри run_polling вызывает asyncio.get_event_loop().
+    # Поэтому явно создаём и назначаем цикл для главного потока до запуска.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     app = Application.builder().token(config.TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
