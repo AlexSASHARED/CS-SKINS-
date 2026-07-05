@@ -1,5 +1,6 @@
 .env
 .catalog_cache.pkl
+.localization_cache.pkl
 __pycache__/
 *.pyc
 .venv/

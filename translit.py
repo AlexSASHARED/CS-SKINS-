@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import re
 
+from localization import LOCALIZATION
+
 # Русские/сокращённые обозначения износа -> каноничное английское имя.
 # Держим только однозначные варианты и стандартные сокращения, чтобы случайно
 # не «съесть» слово из названия скина.
@@ -124,8 +126,11 @@ def translate_query(text: str) -> tuple[str, str | None]:
             s = re.sub(pattern, " ", s)
             break
 
-    # 2. Оружие и популярные скины
-    s = _replace_phrases(s, {**WEAPON_ALIASES, **PATTERN_ALIASES})
+    # 2. Оружие и скины. Официальная локализация из датасета (если загружена)
+    #    дополняет статические словари; при коллизии ключа берём официальную.
+    weapon_map = {**WEAPON_ALIASES, **LOCALIZATION.ru_weapons}
+    pattern_map = {**PATTERN_ALIASES, **LOCALIZATION.ru_patterns}
+    s = _replace_phrases(s, {**weapon_map, **pattern_map})
 
     # 3. Остаток кириллицы -> латиница (запасной вариант)
     if re.search(r"[а-яё]", s):

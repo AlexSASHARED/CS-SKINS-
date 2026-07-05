@@ -31,6 +31,7 @@ from telegram.ext import (
 
 import config
 from catalog import CATALOG
+from localization import LOCALIZATION
 from providers import PriceResult, build_providers
 from skinutils import WEAR_ORDER, WEAR_SHORT
 from translit import translate_query
@@ -292,7 +293,14 @@ async def _post_init(app: Application) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Не удалось прогреть каталог при старте: %s", exc)
 
+    async def _warm_loc() -> None:
+        await LOCALIZATION.ensure()
+        if LOCALIZATION.loaded:
+            logger.info("Локализация прогрета: %d финишей, %d видов оружия",
+                        len(LOCALIZATION.ru_patterns), len(LOCALIZATION.ru_weapons))
+
     asyncio.create_task(_warm())
+    asyncio.create_task(_warm_loc())
 
 
 def main() -> None:
