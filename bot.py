@@ -1,8 +1,10 @@
 """Telegram-бот поиска цен на скины CS2 по разным площадкам.
 
-Пользователь присылает название скина — бот параллельно опрашивает включённые
-площадки (LisSkins, CS.Money, AIM Market, Steam) и присылает сводку цен,
-отсортированную от дешёвых к дорогим.
+Пользователь присылает название скина (на русском или английском). Бот:
+  1. переводит запрос в английские названия каталога;
+  2. если совпадений несколько — показывает кнопки выбора скина;
+  3. затем кнопки выбора износа (FN/MW/FT/WW/BS);
+  4. по точному имени параллельно опрашивает площадки и присылает сводку цен.
 
 Запуск:
     export TELEGRAM_TOKEN="123:ABC"
@@ -11,14 +13,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import logging
 
 import httpx
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -26,7 +30,10 @@ from telegram.ext import (
 )
 
 import config
+from catalog import CATALOG
 from providers import PriceResult, build_providers
+from skinutils import WEAR_ORDER, WEAR_SHORT
+from translit import translate_query
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -34,28 +41,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cs2-price-bot")
 
-# Провайдеры создаём один раз (у LisSkins внутри кэш фида)
+# Провайдеры создаём один раз (у LisSkins/каталога внутри кэш фида)
 PROVIDERS = build_providers(config.ENABLED_PROVIDERS)
+
+# Кэш коротких токенов для callback_data (ограничение Telegram — 64 байта).
+# token(md5-обрезок) -> строка (нормализованное базовое имя или полное имя).
+_TOKENS: dict[str, str] = {}
+
+
+def _token(value: str) -> str:
+    key = hashlib.md5(value.encode("utf-8")).hexdigest()[:12]
+    _TOKENS[key] = value
+    return key
+
 
 START_TEXT = (
     "👋 Привет! Я ищу цены на скины CS2 по площадкам:\n"
     + ", ".join(p.name for p in PROVIDERS)
     + ".\n\n"
-    "Просто пришли название скина, например:\n"
-    "<code>AK-47 | Redline (Field-Tested)</code>\n\n"
-    "Или командой: <code>/price AWP | Asiimov (Field-Tested)</code>"
+    "Пришли название скина — можно <b>по-русски или по-английски</b>, например:\n"
+    "<code>ак редлайн</code> или <code>AK-47 Redline</code>\n\n"
+    "Я покажу кнопки для выбора конкретного скина и износа. Можно сразу указать "
+    "износ: <code>калаш редлайн бс</code> или <code>AWP Asiimov FT</code>."
 )
 
 HELP_TEXT = (
     "📖 <b>Как пользоваться</b>\n\n"
-    "• Пришли название скина текстом — я найду минимальные цены.\n"
+    "• Пришли название скина текстом (RU/EN) — я найду минимальные цены.\n"
+    "• Если вариантов несколько — выберешь кнопкой скин, затем износ.\n"
+    "• Износ можно указать сразу словом или сокращением: "
+    "FN/MW/FT/WW/BS или фн/мв/фт/вв/бс.\n"
     "• <code>/price &lt;название&gt;</code> — то же самое командой.\n\n"
-    "Точнее всего работает полное имя со стиранием, например:\n"
-    "<code>M4A4 | Howl (Minimal Wear)</code>\n\n"
+    "Примеры: <code>ак редлайн</code>, <code>awp азимов ft</code>, "
+    "<code>M4A1-S Printstream</code>, <code>нож керамбит fade</code>.\n\n"
     "Площадки опрашиваются параллельно; если одна недоступна — покажу остальные."
 )
 
 
+# --------------------------------------------------------------------------- #
+#  Поиск цен по площадкам
+# --------------------------------------------------------------------------- #
 async def search_all(query: str) -> list[PriceResult]:
     """Опрашиваем все площадки параллельно, каждая изолирована от чужих сбоев."""
     query = query.strip()
@@ -99,7 +124,6 @@ def format_results(query: str, results: list[PriceResult]) -> str:
     else:
         lines.append("😕 Нигде не нашёл цену по этому запросу.")
 
-    # Показываем и площадки без результата — так видно, где не нашлось/ошибка
     misses = [r for r in results if not r.ok]
     if misses:
         lines.append("")
@@ -110,23 +134,140 @@ def format_results(query: str, results: list[PriceResult]) -> str:
     return "\n".join(lines)
 
 
-async def handle_query(update: Update, query: str) -> None:
-    query = query.strip()
-    if not query:
-        await update.effective_message.reply_text(
-            "Пришли название скина, например: AK-47 | Redline (Field-Tested)")
-        return
+async def _run_prices(message, full_name: str, *, edit: bool) -> None:
+    """Ищем цены по точному имени и показываем результат (новым или тем же сообщением)."""
+    placeholder = "⏳ Ищу цены: <b>%s</b>…" % html.escape(full_name)
+    if edit:
+        target = message
+        await target.edit_text(placeholder, parse_mode=ParseMode.HTML)
+    else:
+        target = await message.reply_text(placeholder, parse_mode=ParseMode.HTML)
 
-    thinking = await update.effective_message.reply_text("⏳ Ищу цены…")
     try:
-        results = await search_all(query)
-        text = format_results(query, results)
+        results = await search_all(full_name)
+        text = format_results(full_name, results)
     except Exception:  # noqa: BLE001
-        logger.exception("Ошибка при обработке запроса %r", query)
+        logger.exception("Ошибка при поиске цен %r", full_name)
         text = "⚠️ Что-то пошло не так при поиске. Попробуй ещё раз."
 
-    await thinking.edit_text(
-        text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await target.edit_text(text, parse_mode=ParseMode.HTML,
+                           disable_web_page_preview=True)
+
+
+# --------------------------------------------------------------------------- #
+#  Экраны выбора: скин -> износ
+# --------------------------------------------------------------------------- #
+async def _show_bases(message, bases, total, wear, *, edit: bool) -> None:
+    widx = (WEAR_ORDER.index(wear) + 1) if wear else 0
+    keyboard = [
+        [InlineKeyboardButton(b["name"], callback_data=f"b:{_token(nb)}:{widx}")]
+        for nb, b in bases
+    ]
+    text = "🔎 Нашёл несколько вариантов — выбери скин:"
+    if total > len(bases):
+        text += f"\n<i>Показаны первые {len(bases)} из {total}. Уточни запрос, если нужного нет.</i>"
+    markup = InlineKeyboardMarkup(keyboard)
+    if edit:
+        await message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    else:
+        await message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+
+async def _show_wears(message, base_entry, wear, *, edit: bool) -> None:
+    wears = base_entry["wears"]
+
+    # Износ уже выбран пользователем и доступен — сразу к ценам
+    if wear and wear in wears:
+        await _run_prices(message, wears[wear], edit=edit)
+        return
+    # У предмета нет градаций износа — одно значение
+    if list(wears.keys()) == [""]:
+        await _run_prices(message, wears[""], edit=edit)
+        return
+
+    row = [
+        InlineKeyboardButton(WEAR_SHORT[w], callback_data=f"w:{_token(wears[w])}")
+        for w in WEAR_ORDER if w in wears
+    ]
+    keyboard = [[btn] for btn in row]  # по одной кнопке в ряд — подписи длинные
+    if "" in wears:
+        keyboard.append(
+            [InlineKeyboardButton("Без износа", callback_data=f"w:{_token(wears[''])}")]
+        )
+
+    text = f"🎯 <b>{html.escape(base_entry['name'])}</b>\nВыбери износ:"
+    markup = InlineKeyboardMarkup(keyboard)
+    if edit:
+        await message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    else:
+        await message.reply_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+
+# --------------------------------------------------------------------------- #
+#  Обработчики
+# --------------------------------------------------------------------------- #
+async def handle_text(message, raw: str) -> None:
+    raw = (raw or "").strip()
+    if not raw:
+        await message.reply_text(
+            "Пришли название скина, например: ак редлайн или AK-47 Redline")
+        return
+
+    query, wear = translate_query(raw)
+    query = query or raw
+
+    # Пытаемся загрузить каталог; если фид недоступен — прямой поиск по площадкам
+    async with httpx.AsyncClient(
+        timeout=config.REQUEST_TIMEOUT, follow_redirects=True,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; CS2PriceBot/1.0)"},
+    ) as client:
+        try:
+            await CATALOG.ensure(client)
+        except Exception:  # noqa: BLE001
+            logger.warning("Каталог недоступен, прямой поиск по %r", query)
+            await _run_prices(await message.reply_text("⏳ Ищу цены…"),
+                              query, edit=True)
+            return
+
+    bases, total = CATALOG.search_bases(query)
+    if not bases:
+        await message.reply_text(
+            f"😕 Не нашёл скин по запросу «{html.escape(raw)}».\n"
+            "Попробуй иначе, например: <code>AK-47 Redline</code> или "
+            "<code>ак редлайн</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if len(bases) == 1:
+        await _show_wears(message, bases[0][1], wear, edit=False)
+    else:
+        await _show_bases(message, bases, total, wear, edit=False)
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data.startswith("b:"):
+        _, tok, widx = data.split(":", 2)
+        nb = _TOKENS.get(tok)
+        entry = CATALOG.bases.get(nb) if nb else None
+        if entry is None:
+            await query.edit_message_text(
+                "⏳ Сессия устарела — отправь название скина заново.")
+            return
+        wear = WEAR_ORDER[int(widx) - 1] if widx != "0" else None
+        await _show_wears(query.message, entry, wear, edit=True)
+
+    elif data.startswith("w:"):
+        _, tok = data.split(":", 1)
+        full_name = _TOKENS.get(tok)
+        if not full_name:
+            await query.edit_message_text(
+                "⏳ Сессия устарела — отправь название скина заново.")
+            return
+        await _run_prices(query.message, full_name, edit=True)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -138,12 +279,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = " ".join(context.args) if context.args else ""
-    await handle_query(update, query)
+    await handle_text(update.effective_message,
+                      " ".join(context.args) if context.args else "")
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle_query(update, update.effective_message.text or "")
+    await handle_text(update.effective_message, update.effective_message.text or "")
 
 
 def main() -> None:
@@ -157,7 +298,6 @@ def main() -> None:
 
     # В Python 3.12+/3.14 asyncio больше не создаёт event loop автоматически,
     # а python-telegram-bot внутри run_polling вызывает asyncio.get_event_loop().
-    # Поэтому явно создаём и назначаем цикл для главного потока до запуска.
     try:
         asyncio.get_event_loop()
     except RuntimeError:
@@ -167,6 +307,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("price", cmd_price))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     logger.info("Бот запущен. Площадки: %s", ", ".join(p.name for p in PROVIDERS))

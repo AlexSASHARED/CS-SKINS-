@@ -1,11 +1,14 @@
 """Базовый интерфейс провайдера площадки и общая модель результата."""
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Optional
 
 import httpx
+
+# Утилиты имён живут в модуле верхнего уровня, чтобы избежать циклических
+# импортов; ре-экспортируем их здесь для удобства провайдеров.
+from skinutils import normalize, tokens  # noqa: F401
 
 
 @dataclass
@@ -24,25 +27,6 @@ class PriceResult:
     @property
     def ok(self) -> bool:
         return self.error is None and self.price is not None
-
-
-def normalize(name: str) -> str:
-    """Приводим название к единому виду для сравнения.
-
-    Убираем регистр, лишние пробелы и повторяющиеся разделители, чтобы
-    'AK-47 | Redline (Field-Tested)' и 'ak47 redline field tested'
-    считались похожими.
-    """
-    name = name.lower()
-    name = name.replace("★", " ").replace("™", " ")
-    # унифицируем разделители
-    name = re.sub(r"[|()\-_/]", " ", name)
-    name = re.sub(r"\s+", " ", name)
-    return name.strip()
-
-
-def tokens(name: str) -> list[str]:
-    return [t for t in normalize(name).split(" ") if t]
 
 
 class BaseProvider:
