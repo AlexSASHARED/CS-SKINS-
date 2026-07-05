@@ -42,11 +42,15 @@ class SteamProvider(BaseProvider):
         }
         headers = {"User-Agent": "Mozilla/5.0 (compatible; CS2PriceBot/1.0)"}
         try:
-            resp = await client.get(API_URL, params=params, headers=headers, timeout=25.0)
+            resp = await client.get(API_URL, params=params, headers=headers, timeout=10.0)
             resp.raise_for_status()
             data = resp.json()
+        except httpx.HTTPStatusError as exc:
+            return self._error(query, f"HTTP {exc.response.status_code}")
+        except httpx.TimeoutException:
+            return self._error(query, "таймаут")
         except Exception as exc:  # noqa: BLE001
-            return self._error(query, f"API недоступен ({exc.__class__.__name__})")
+            return self._error(query, exc.__class__.__name__)
 
         if not data.get("success"):
             return PriceResult(market=self.name, query=query, error="не найдено")

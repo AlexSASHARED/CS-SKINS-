@@ -22,4 +22,4 @@ ENABLED_PROVIDERS: list[str] | None = (
 )
 
 # Таймаут запроса к площадкам, секунд
-REQUEST_TIMEOUT: float = float(os.environ.get("REQUEST_TIMEOUT", "30"))
+REQUEST_TIMEOUT: float = float(os.environ.get("REQUEST_TIMEOUT", "15"))

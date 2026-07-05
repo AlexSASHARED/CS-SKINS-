@@ -216,18 +216,14 @@ async def handle_text(message, raw: str) -> None:
     query, wear = translate_query(raw)
     query = query or raw
 
-    # Пытаемся загрузить каталог; если фид недоступен — прямой поиск по площадкам
-    async with httpx.AsyncClient(
-        timeout=config.REQUEST_TIMEOUT, follow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; CS2PriceBot/1.0)"},
-    ) as client:
-        try:
-            await CATALOG.ensure(client)
-        except Exception:  # noqa: BLE001
-            logger.warning("Каталог недоступен, прямой поиск по %r", query)
-            await _run_prices(await message.reply_text("⏳ Ищу цены…"),
-                              query, edit=True)
-            return
+    # Каталог отдаётся из кэша мгновенно; ждём только при самой первой загрузке.
+    try:
+        await CATALOG.ensure()
+    except Exception:  # noqa: BLE001
+        logger.warning("Каталог недоступен, прямой поиск по %r", query)
+        await _run_prices(await message.reply_text("⏳ Ищу цены…"),
+                          query, edit=True)
+        return
 
     bases, total = CATALOG.search_bases(query)
     if not bases:
@@ -287,6 +283,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await handle_text(update.effective_message, update.effective_message.text or "")
 
 
+async def _post_init(app: Application) -> None:
+    """Прогреваем каталог в фоне сразу после старта, чтобы первый запрос не ждал фид."""
+    async def _warm() -> None:
+        try:
+            await CATALOG.ensure()
+            logger.info("Каталог прогрет: %d скинов", len(CATALOG.bases))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось прогреть каталог при старте: %s", exc)
+
+    asyncio.create_task(_warm())
+
+
 def main() -> None:
     if not config.TELEGRAM_TOKEN:
         raise SystemExit(
@@ -303,7 +311,7 @@ def main() -> None:
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
-    app = Application.builder().token(config.TELEGRAM_TOKEN).build()
+    app = Application.builder().token(config.TELEGRAM_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("price", cmd_price))
