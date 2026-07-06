@@ -31,6 +31,7 @@ from telegram.ext import (
 
 import config
 from catalog import CATALOG
+from inventory import InventoryError, fetch_inventory, resolve_steamid
 from localization import LOCALIZATION
 from providers import PriceResult, build_providers
 from skinutils import WEAR_ORDER, WEAR_SHORT
@@ -63,7 +64,9 @@ START_TEXT = (
     "Пришли название скина — можно <b>по-русски или по-английски</b>, например:\n"
     "<code>ак редлайн</code> или <code>AK-47 Redline</code>\n\n"
     "Я покажу кнопки для выбора конкретного скина и износа. Можно сразу указать "
-    "износ: <code>калаш редлайн бс</code> или <code>AWP Asiimov FT</code>."
+    "износ: <code>калаш редлайн бс</code> или <code>AWP Asiimov FT</code>.\n\n"
+    "📦 А ещё оценю весь инвентарь: "
+    "<code>/inventory &lt;SteamID или ссылка на профиль&gt;</code>"
 )
 
 HELP_TEXT = (
@@ -72,7 +75,9 @@ HELP_TEXT = (
     "• Если вариантов несколько — выберешь кнопкой скин, затем износ.\n"
     "• Износ можно указать сразу словом или сокращением: "
     "FN/MW/FT/WW/BS или фн/мв/фт/вв/бс.\n"
-    "• <code>/price &lt;название&gt;</code> — то же самое командой.\n\n"
+    "• <code>/price &lt;название&gt;</code> — то же самое командой.\n"
+    "• <code>/inventory &lt;SteamID/ссылка&gt;</code> — оценить весь инвентарь "
+    "по площадкам (профиль должен быть открыт).\n\n"
     "Примеры: <code>ак редлайн</code>, <code>awp азимов ft</code>, "
     "<code>M4A1-S Printstream</code>, <code>нож керамбит fade</code>.\n\n"
     "Площадки опрашиваются параллельно; если одна недоступна — покажу остальные."
@@ -267,6 +272,110 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _run_prices(query.message, full_name, edit=True)
 
 
+def _value_inventory(counts: dict[str, int]) -> list[tuple[str, float, int]]:
+    """Оценка инвентаря по фид-площадкам с полным прайс-листом.
+
+    Возвращает список (площадка, сумма_USD, сколько_предметов_оценено),
+    отсортированный по сумме убыванием. Оценивает LisSkins и Skinport —
+    они держат весь прайс в памяти, поэтому оценка мгновенная.
+    """
+    results: list[tuple[str, float, int]] = []
+
+    # LisSkins — из общего каталога
+    total, priced = 0.0, 0
+    for name, qty in counts.items():
+        slot = CATALOG.price_of(name)
+        if slot:
+            total += slot["price"] * qty
+            priced += qty
+    if priced:
+        results.append(("LisSkins", total, priced))
+
+    # Skinport — из индекса провайдера (если включён)
+    sp = next((p for p in PROVIDERS if p.name == "Skinport"), None)
+    if sp is not None:
+        total, priced = 0.0, 0
+        for name, qty in counts.items():
+            slot = sp.price_of(name)
+            if slot:
+                total += slot["price"] * qty
+                priced += qty
+        if priced:
+            results.append(("Skinport", total, priced))
+
+    results.sort(key=lambda r: r[1], reverse=True)
+    return results
+
+
+async def cmd_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    arg = " ".join(context.args) if context.args else ""
+    if not arg.strip():
+        await update.effective_message.reply_text(
+            "Пришли SteamID64 или ссылку на профиль:\n"
+            "<code>/inventory 76561198000000000</code>\n"
+            "<code>/inventory https://steamcommunity.com/id/ник</code>\n\n"
+            "⚠️ Инвентарь и профиль должны быть <b>открытыми</b> в настройках Steam.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    msg = await update.effective_message.reply_text("⏳ Загружаю инвентарь…")
+    try:
+        async with httpx.AsyncClient(
+            timeout=config.REQUEST_TIMEOUT, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; CS2PriceBot/1.0)"},
+        ) as client:
+            steamid = await resolve_steamid(client, arg)
+            if not steamid:
+                await msg.edit_text("😕 Не смог определить SteamID. Пришли SteamID64 "
+                                    "или ссылку на профиль.")
+                return
+            counts = await fetch_inventory(client, steamid)
+            if not counts:
+                await msg.edit_text("😕 Инвентарь пуст или скрыт настройками приватности.")
+                return
+            # Прогреваем прайс-листы
+            await CATALOG.ensure()
+            sp = next((p for p in PROVIDERS if p.name == "Skinport"), None)
+            if sp is not None:
+                try:
+                    await sp.ensure(client)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        total_items = sum(counts.values())
+        valued = _value_inventory(counts)
+        text = _format_inventory(steamid, total_items, len(counts), valued)
+    except InventoryError as exc:
+        text = f"🔒 {html.escape(str(exc))}"
+    except Exception:  # noqa: BLE001
+        logger.exception("Ошибка при оценке инвентаря %r", arg)
+        text = "⚠️ Не удалось получить инвентарь. Проверь, что профиль открыт."
+
+    await msg.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+def _format_inventory(steamid: str, total_items: int, unique: int,
+                      valued: list[tuple[str, float, int]]) -> str:
+    lines = [
+        f"📦 <b>Инвентарь</b> <code>{steamid}</code>",
+        f"Предметов: {total_items} (уникальных: {unique})\n",
+    ]
+    if not valued:
+        lines.append("😕 Не удалось оценить ни одного предмета "
+                     "(возможно, в инвентаре нет ходовых предметов CS2).")
+    else:
+        best = valued[0]
+        for market, total, priced in valued:
+            mark = "🥇 " if (market, total, priced) == best else ""
+            miss = total_items - priced
+            note = f" · оценено {priced}/{total_items}" if miss else ""
+            lines.append(f"{mark}<b>{html.escape(market)}</b> — "
+                         f"{total:,.2f} USD{note}".replace(",", " "))
+        lines.append("\n<i>Оценка по минимальным ценам площадок. "
+                     "Неоценённые предметы — не найдены в прайс-листе.</i>")
+    return "\n".join(lines)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(START_TEXT, parse_mode=ParseMode.HTML)
 
@@ -296,8 +405,9 @@ async def _post_init(app: Application) -> None:
     async def _warm_loc() -> None:
         await LOCALIZATION.ensure()
         if LOCALIZATION.loaded:
-            logger.info("Локализация прогрета: %d финишей, %d видов оружия",
-                        len(LOCALIZATION.ru_patterns), len(LOCALIZATION.ru_weapons))
+            logger.info("Локализация прогрета: %d финишей, %d оружия, %d прочих названий",
+                        len(LOCALIZATION.ru_patterns), len(LOCALIZATION.ru_weapons),
+                        len(LOCALIZATION.ru_names))
 
     asyncio.create_task(_warm())
     asyncio.create_task(_warm_loc())
@@ -323,6 +433,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("price", cmd_price))
+    app.add_handler(CommandHandler("inventory", cmd_inventory))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 

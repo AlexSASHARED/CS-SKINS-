@@ -70,7 +70,7 @@ PATTERN_ALIASES: dict[str, str] = {
     "редлайн": "redline", "редлан": "redline",
     "асиимов": "asiimov", "азимов": "asiimov", "асимов": "asiimov",
     "вулкан": "vulcan",
-    "фейд": "fade",
+    "фейд": "fade", "градиент": "fade", "выцветание": "fade",
     "гипербист": "hyper beast", "гипер бист": "hyper beast",
     "нептун": "neptune",
     "драгон лор": "dragon lore", "лор дракона": "dragon lore",
@@ -126,8 +126,12 @@ def translate_query(text: str) -> tuple[str, str | None]:
             s = re.sub(pattern, " ", s)
             break
 
-    # 2. Оружие и скины. Официальная локализация из датасета (если загружена)
-    #    дополняет статические словари; при коллизии ключа берём официальную.
+    # 2a. Полные названия прочих предметов (кейсы, коллекции, агенты…) RU -> EN.
+    if LOCALIZATION.ru_names:
+        s = _replace_phrases(s, LOCALIZATION.ru_names)
+
+    # 2b. Оружие и скины. Официальная локализация из датасета (если загружена)
+    #     дополняет статические словари; при коллизии ключа берём официальную.
     weapon_map = {**WEAPON_ALIASES, **LOCALIZATION.ru_weapons}
     pattern_map = {**PATTERN_ALIASES, **LOCALIZATION.ru_patterns}
     s = _replace_phrases(s, {**weapon_map, **pattern_map})

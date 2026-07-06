@@ -67,6 +67,13 @@ class SkinportProvider(BaseProvider):
             self._index = index
             self._fetched_at = time.time()
 
+    async def ensure(self, client: httpx.AsyncClient) -> None:
+        """Публичный доступ к прогреву индекса (для оптовой оценки инвентаря)."""
+        await self._refresh(client)
+
+    def price_of(self, name: str) -> dict | None:
+        return self._index.get(normalize(name))
+
     async def search(self, client: httpx.AsyncClient, query: str) -> PriceResult:
         try:
             await self._refresh(client)
