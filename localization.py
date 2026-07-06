@@ -21,6 +21,8 @@ import time
 
 import httpx
 
+from skinutils import clean_phrase as _key
+
 logger = logging.getLogger("cs2-price-bot.localization")
 
 BASE_URL = "https://bymykel.github.io/CSGO-API/api/{lang}/{file}"
@@ -41,12 +43,6 @@ EXTRA_FILES = [
 TTL = 7 * 24 * 3600  # неделя
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           ".localization_cache.pkl")
-
-
-def _key(name: str) -> str:
-    """Ключ для сопоставления: нижний регистр, без звёзд/™, схлопнутые пробелы."""
-    name = name.lower().replace("★", " ").replace("™", " ")
-    return " ".join(name.split())
 
 
 class Localization:

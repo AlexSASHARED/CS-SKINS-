@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 
 from localization import LOCALIZATION
+from skinutils import clean_phrase
 
 # Русские/сокращённые обозначения износа -> каноничное английское имя.
 # Держим только однозначные варианты и стандартные сокращения, чтобы случайно
@@ -78,6 +79,9 @@ PATTERN_ALIASES: dict[str, str] = {
     "хаул": "howl", "вой": "howl",
     "нео-нуар": "neo-noir", "неонуар": "neo-noir",
     "принтстрим": "printstream", "принт стрим": "printstream",
+    "поток информации": "printstream",  # официальное RU-название Printstream
+    "красная линия": "redline",
+    "гипер-зверь": "hyper beast", "гипер зверь": "hyper beast",
     "императрица": "empress",
     "гунгнир": "gungnir",
     "кровавая паутина": "crimson web",
@@ -102,45 +106,68 @@ def transliterate(text: str) -> str:
     return "".join(_TRANSLIT.get(ch, ch) for ch in text)
 
 
-def _replace_phrases(text: str, mapping: dict[str, str]) -> str:
-    """Заменяем алиасы по границам слов, длинные — раньше коротких."""
-    for alias in sorted(mapping, key=len, reverse=True):
-        if not alias:
-            continue
-        pattern = r"(?<!\w)" + re.escape(alias) + r"(?!\w)"
-        text = re.sub(pattern, " " + mapping[alias] + " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+# Статические словари с очищенными ключами (готовы к пословному матчингу)
+_WEAPONS_C = {clean_phrase(k): v for k, v in WEAPON_ALIASES.items()}
+_PATTERNS_C = {clean_phrase(k): v for k, v in PATTERN_ALIASES.items()}
+_WEARS_C = {clean_phrase(k): v for k, v in WEAR_ALIASES.items()}
+
+_MAX_WORDS = 8  # самое длинное составное название (кейсы/коллекции)
+
+
+def _extract_wear(words: list[str]) -> tuple[str | None, list[str]]:
+    """Находим и вырезаем из токенов упоминание износа (длиннейшее совпадение)."""
+    n = len(words)
+    for i in range(n):
+        for j in range(min(4, n - i), 0, -1):
+            phrase = " ".join(words[i:i + j])
+            if phrase in _WEARS_C:
+                return _WEARS_C[phrase], words[:i] + words[i + j:]
+    return None, words
+
+
+def _apply_map(words: list[str], mapping: dict[str, str]) -> list[str]:
+    """Жадно заменяем последовательности слов на значения из словаря.
+
+    На каждой позиции берём самую длинную фразу, которая есть в словаре
+    (O(1) поиск по dict) — быстро даже для тысяч записей.
+    """
+    out: list[str] = []
+    i, n = 0, len(words)
+    while i < n:
+        hit = False
+        for j in range(min(_MAX_WORDS, n - i), 0, -1):
+            phrase = " ".join(words[i:i + j])
+            repl = mapping.get(phrase)
+            if repl is not None:
+                out.extend(repl.split())
+                i += j
+                hit = True
+                break
+        if not hit:
+            out.append(words[i])
+            i += 1
+    return out
 
 
 def translate_query(text: str) -> tuple[str, str | None]:
     """Возвращает (строка_для_поиска_на_английском, износ_или_None)."""
-    s = text.lower().replace("|", " ")
-    s = re.sub(r"\s+", " ", s).strip()
+    words = clean_phrase(text).split()
 
-    # 1. Износ (самое длинное совпадение)
-    wear: str | None = None
-    for alias in sorted(WEAR_ALIASES, key=len, reverse=True):
-        pattern = r"(?<!\w)" + re.escape(alias) + r"(?!\w)"
-        if re.search(pattern, s):
-            wear = WEAR_ALIASES[alias]
-            s = re.sub(pattern, " ", s)
-            break
+    # 1. Износ (вырезаем из запроса)
+    wear, words = _extract_wear(words)
 
-    # 2a. Полные названия прочих предметов (кейсы, коллекции, агенты…) RU -> EN.
-    if LOCALIZATION.ru_names:
-        s = _replace_phrases(s, LOCALIZATION.ru_names)
+    # 2. Единый словарь RU->EN: официальная локализация (кейсы/оружие/финиши)
+    #    поверх статических синонимов. Самая длинная фраза выигрывает, поэтому
+    #    'поток информации' (2 слова) бьёт любое односложное совпадение.
+    combined = {
+        **_WEAPONS_C, **_PATTERNS_C,
+        **LOCALIZATION.ru_names,
+        **LOCALIZATION.ru_weapons, **LOCALIZATION.ru_patterns,
+    }
+    words = _apply_map(words, combined)
 
-    # 2b. Оружие и скины. Официальная локализация из датасета (если загружена)
-    #     дополняет статические словари; при коллизии ключа берём официальную.
-    weapon_map = {**WEAPON_ALIASES, **LOCALIZATION.ru_weapons}
-    pattern_map = {**PATTERN_ALIASES, **LOCALIZATION.ru_patterns}
-    s = _replace_phrases(s, {**weapon_map, **pattern_map})
-
+    s = " ".join(words)
     # 3. Остаток кириллицы -> латиница (запасной вариант)
     if re.search(r"[а-яё]", s):
         s = transliterate(s)
-
-    # Убираем осиротевшие скобки (например, после вырезанного износа)
-    s = re.sub(r"[()\[\]]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s, wear
+    return " ".join(s.split()), wear
